@@ -1,16 +1,14 @@
-// Copyright 2017 fatedier, fatedier@gmail.com
+// 版权所有 2017 fatedier, fatedier@gmail.com
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// 根据 Apache 许可证 2.0 版本授权
+// 除非遵守许可证，否则不得使用本文件。
+// 可通过以下链接获取许可证副本：
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// 除非适用法律要求或书面同意，软件按“原样”提供，
+// 不附带任何明示或暗示的保证或条件。
+// 有关具体语言，请参阅许可证。
 
 package client
 
@@ -32,56 +30,32 @@ import (
 	"github.com/fatedier/frp/pkg/vnet"
 )
 
+// SessionContext 表示一次客户端和服务器建立的完整会话上下文
 type SessionContext struct {
-	// The client common configuration.
-	Common *v1.ClientCommonConfig
-
-	// Unique ID obtained from frps.
-	// It should be attached to the login message when reconnecting.
-	RunID string
-	// Underlying control connection. Once conn is closed, the msgDispatcher and the entire Control will exit.
-	Conn net.Conn
-	// Indicates whether the connection is encrypted.
-	ConnEncrypted bool
-	// Sets authentication based on selected method
-	AuthSetter auth.Setter
-	// Connector is used to create new connections, which could be real TCP connections or virtual streams.
-	Connector Connector
-	// Virtual net controller
-	VnetController *vnet.Controller
+	Common         *v1.ClientCommonConfig // 客户端公共配置
+	RunID          string                 // 从 frps 获取的唯一标识，用于重连时使用
+	Conn           net.Conn               // 控制连接，一旦关闭，msgDispatcher 和 Control 会全部退出
+	ConnEncrypted  bool                   // 是否加密连接
+	AuthSetter     auth.Setter            // 根据选定的认证方式设置身份认证
+	Connector      Connector              // 用于创建连接的对象（真实 TCP 或虚拟连接）
+	VnetController *vnet.Controller       // 虚拟网络控制器
 }
 
+// Control 控制器，管理客户端与服务器之间的主连接及其通信行为
 type Control struct {
-	// service context
-	ctx context.Context
-	xl  *xlog.Logger
-
-	// session context
-	sessionCtx *SessionContext
-
-	// manage all proxies
-	pm *proxy.Manager
-
-	// manage all visitors
-	vm *visitor.Manager
-
-	doneCh chan struct{}
-
-	// of time.Time, last time got the Pong message
-	lastPong atomic.Value
-
-	// The role of msgTransporter is similar to HTTP2.
-	// It allows multiple messages to be sent simultaneously on the same control connection.
-	// The server's response messages will be dispatched to the corresponding waiting goroutines based on the laneKey and message type.
-	msgTransporter transport.MessageTransporter
-
-	// msgDispatcher is a wrapper for control connection.
-	// It provides a channel for sending messages, and you can register handlers to process messages based on their respective types.
-	msgDispatcher *msg.Dispatcher
+	ctx             context.Context
+	xl              *xlog.Logger
+	sessionCtx      *SessionContext
+	pm              *proxy.Manager
+	vm              *visitor.Manager
+	doneCh          chan struct{}
+	lastPong        atomic.Value
+	msgTransporter  transport.MessageTransporter
+	msgDispatcher   *msg.Dispatcher
 }
 
+// 创建新的控制器实例
 func NewControl(ctx context.Context, sessionCtx *SessionContext) (*Control, error) {
-	// new xlog instance
 	ctl := &Control{
 		ctx:        ctx,
 		xl:         xlog.FromContextSafe(ctx),
@@ -108,105 +82,106 @@ func NewControl(ctx context.Context, sessionCtx *SessionContext) (*Control, erro
 	return ctl, nil
 }
 
+// 启动所有代理和访问器
 func (ctl *Control) Run(proxyCfgs []v1.ProxyConfigurer, visitorCfgs []v1.VisitorConfigurer) {
 	go ctl.worker()
 
-	// start all proxies
 	ctl.pm.UpdateAll(proxyCfgs)
-
-	// start all visitors
 	ctl.vm.UpdateAll(visitorCfgs)
 }
 
+// 设置处理工作连接的回调
 func (ctl *Control) SetInWorkConnCallback(cb func(*v1.ProxyBaseConfig, net.Conn, *msg.StartWorkConn) bool) {
 	ctl.pm.SetInWorkConnCallback(cb)
 }
 
+// 处理服务器请求新的工作连接消息
 func (ctl *Control) handleReqWorkConn(_ msg.Message) {
 	xl := ctl.xl
 	workConn, err := ctl.connectServer()
 	if err != nil {
-		xl.Warnf("start new connection to server error: %v", err)
+		xl.Warnf("创建工作连接失败: %v", err)
 		return
 	}
 
-	m := &msg.NewWorkConn{
-		RunID: ctl.sessionCtx.RunID,
-	}
+	m := &msg.NewWorkConn{RunID: ctl.sessionCtx.RunID}
 	if err = ctl.sessionCtx.AuthSetter.SetNewWorkConn(m); err != nil {
-		xl.Warnf("error during NewWorkConn authentication: %v", err)
+		xl.Warnf("工作连接认证失败: %v", err)
 		workConn.Close()
 		return
 	}
 	if err = msg.WriteMsg(workConn, m); err != nil {
-		xl.Warnf("work connection write to server error: %v", err)
+		xl.Warnf("发送工作连接消息失败: %v", err)
 		workConn.Close()
 		return
 	}
 
 	var startMsg msg.StartWorkConn
 	if err = msg.ReadMsgInto(workConn, &startMsg); err != nil {
-		xl.Tracef("work connection closed before response StartWorkConn message: %v", err)
+		xl.Tracef("工作连接在接收 StartWorkConn 前关闭: %v", err)
 		workConn.Close()
 		return
 	}
 	if startMsg.Error != "" {
-		xl.Errorf("StartWorkConn contains error: %s", startMsg.Error)
+		xl.Errorf("StartWorkConn 返回错误: %s", startMsg.Error)
 		workConn.Close()
 		return
 	}
 
-	// dispatch this work connection to related proxy
+	// 将工作连接分发给对应的代理
 	ctl.pm.HandleWorkConn(startMsg.ProxyName, workConn, &startMsg)
 }
 
+// 处理服务器返回的新代理响应
 func (ctl *Control) handleNewProxyResp(m msg.Message) {
 	xl := ctl.xl
 	inMsg := m.(*msg.NewProxyResp)
-	// Server will return NewProxyResp message to each NewProxy message.
-	// Start a new proxy handler if no error got
+
 	err := ctl.pm.StartProxy(inMsg.ProxyName, inMsg.RemoteAddr, inMsg.Error)
 	if err != nil {
-		xl.Warnf("[%s] start error: %v", inMsg.ProxyName, err)
+		xl.Warnf("[%s] 启动失败: %v", inMsg.ProxyName, err)
 	} else {
-		xl.Infof("[%s] start proxy success", inMsg.ProxyName)
+		xl.Infof("[%s] 启动代理成功", inMsg.ProxyName)
 	}
 }
 
+// 处理穿透打洞响应消息
 func (ctl *Control) handleNatHoleResp(m msg.Message) {
 	xl := ctl.xl
 	inMsg := m.(*msg.NatHoleResp)
 
-	// Dispatch the NatHoleResp message to the related proxy.
 	ok := ctl.msgTransporter.DispatchWithType(inMsg, msg.TypeNameNatHoleResp, inMsg.TransactionID)
 	if !ok {
-		xl.Tracef("dispatch NatHoleResp message to related proxy error")
+		xl.Tracef("NatHoleResp 消息分发失败")
 	}
 }
 
+// 处理服务器 PONG 消息（心跳响应）
 func (ctl *Control) handlePong(m msg.Message) {
 	xl := ctl.xl
 	inMsg := m.(*msg.Pong)
 
 	if inMsg.Error != "" {
-		xl.Errorf("pong message contains error: %s", inMsg.Error)
+		xl.Errorf("Pong 消息错误: %s", inMsg.Error)
 		ctl.closeSession()
 		return
 	}
 	ctl.lastPong.Store(time.Now())
-	xl.Debugf("receive heartbeat from server")
+	xl.Debugf("收到服务器心跳响应")
 }
 
-// closeSession closes the control connection.
+// 关闭控制连接
 func (ctl *Control) closeSession() {
 	ctl.sessionCtx.Conn.Close()
 	ctl.sessionCtx.Connector.Close()
 }
 
+// 主动关闭控制器
 func (ctl *Control) Close() error {
 	return ctl.GracefulClose(0)
 }
 
+// 优雅关闭控制器，延迟 d 后释放资源
 func (ctl *Control) GracefulClose(d time.Duration) error {
 	ctl.pm.Close()
 	ctl.vm.Close()
@@ -217,16 +192,17 @@ func (ctl *Control) GracefulClose(d time.Duration) error {
 	return nil
 }
 
-// Done returns a channel that will be closed after all resources are released
+// 返回一个 channel，当所有资源释放后关闭
 func (ctl *Control) Done() <-chan struct{} {
 	return ctl.doneCh
 }
 
-// connectServer return a new connection to frps
+// 创建一条新的控制连接到服务器
 func (ctl *Control) connectServer() (net.Conn, error) {
 	return ctl.sessionCtx.Connector.Connect()
 }
 
+// 注册所有支持的消息处理器
 func (ctl *Control) registerMsgHandlers() {
 	ctl.msgDispatcher.RegisterHandler(&msg.ReqWorkConn{}, msg.AsyncHandler(ctl.handleReqWorkConn))
 	ctl.msgDispatcher.RegisterHandler(&msg.NewProxyResp{}, ctl.handleNewProxyResp)
@@ -234,17 +210,16 @@ func (ctl *Control) registerMsgHandlers() {
 	ctl.msgDispatcher.RegisterHandler(&msg.Pong{}, ctl.handlePong)
 }
 
-// heartbeatWorker sends heartbeat to server and check heartbeat timeout.
+// 心跳检测与定时器
 func (ctl *Control) heartbeatWorker() {
 	xl := ctl.xl
 
 	if ctl.sessionCtx.Common.Transport.HeartbeatInterval > 0 {
-		// Send heartbeat to server.
 		sendHeartBeat := func() (bool, error) {
-			xl.Debugf("send heartbeat to server")
+			xl.Debugf("发送心跳到服务器")
 			pingMsg := &msg.Ping{}
 			if err := ctl.sessionCtx.AuthSetter.SetPing(pingMsg); err != nil {
-				xl.Warnf("error during ping authentication: %v, skip sending ping message", err)
+				xl.Warnf("心跳认证失败: %v，跳过", err)
 				return false, err
 			}
 			_ = ctl.msgDispatcher.Send(pingMsg)
@@ -263,11 +238,12 @@ func (ctl *Control) heartbeatWorker() {
 		)
 	}
 
-	// Check heartbeat timeout.
-	if ctl.sessionCtx.Common.Transport.HeartbeatInterval > 0 && ctl.sessionCtx.Common.Transport.HeartbeatTimeout > 0 {
+	// 心跳超时检测
+	if ctl.sessionCtx.Common.Transport.HeartbeatInterval > 0 &&
+		ctl.sessionCtx.Common.Transport.HeartbeatTimeout > 0 {
 		go wait.Until(func() {
 			if time.Since(ctl.lastPong.Load().(time.Time)) > time.Duration(ctl.sessionCtx.Common.Transport.HeartbeatTimeout)*time.Second {
-				xl.Warnf("heartbeat timeout")
+				xl.Warnf("心跳超时")
 				ctl.closeSession()
 				return
 			}
@@ -275,6 +251,7 @@ func (ctl *Control) heartbeatWorker() {
 	}
 }
 
+// 后台运行控制器主逻辑
 func (ctl *Control) worker() {
 	go ctl.heartbeatWorker()
 	go ctl.msgDispatcher.Run()
@@ -287,6 +264,7 @@ func (ctl *Control) worker() {
 	close(ctl.doneCh)
 }
 
+// 更新所有代理与访客配置
 func (ctl *Control) UpdateAllConfigurer(proxyCfgs []v1.ProxyConfigurer, visitorCfgs []v1.VisitorConfigurer) error {
 	ctl.vm.UpdateAll(visitorCfgs)
 	ctl.pm.UpdateAll(proxyCfgs)
