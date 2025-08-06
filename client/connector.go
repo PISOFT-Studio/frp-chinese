@@ -1,16 +1,12 @@
-// Copyright 2023 The frp Authors
+// 版权所有 2023 frp 项目作者
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
+// 根据 Apache License, Version 2.0 许可证授权
+// 除非符合许可证规定，否则您不得使用此文件
+// 获取许可证副本请访问：
 //     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// 本文件按“原样”提供，不提供任何明示或暗示的担保
+// 详情请参考许可证内容
 
 package client
 
@@ -35,14 +31,14 @@ import (
 	"github.com/fatedier/frp/pkg/util/xlog"
 )
 
-// Connector is an interface for establishing connections to the server.
+// Connector 是一个用于建立到服务端连接的接口
 type Connector interface {
-	Open() error
-	Connect() (net.Conn, error)
-	Close() error
+	Open() error          // 打开底层连接
+	Connect() (net.Conn, error) // 获取一个逻辑连接
+	Close() error         // 关闭连接
 }
 
-// defaultConnectorImpl is the default implementation of Connector for normal frpc.
+// defaultConnectorImpl 是 frpc 的默认连接实现
 type defaultConnectorImpl struct {
 	ctx context.Context
 	cfg *v1.ClientCommonConfig
@@ -52,6 +48,7 @@ type defaultConnectorImpl struct {
 	closeOnce  sync.Once
 }
 
+// 创建一个默认连接器实例
 func NewConnector(ctx context.Context, cfg *v1.ClientCommonConfig) Connector {
 	return &defaultConnectorImpl{
 		ctx: ctx,
@@ -59,14 +56,13 @@ func NewConnector(ctx context.Context, cfg *v1.ClientCommonConfig) Connector {
 	}
 }
 
-// Open opens an underlying connection to the server.
-// The underlying connection is either a TCP connection or a QUIC connection.
-// After the underlying connection is established, you can call Connect() to get a stream.
-// If TCPMux isn't enabled, the underlying connection is nil, you will get a new real TCP connection every time you call Connect().
+// Open 方法会建立到底层服务端的连接，可能是 TCP 或 QUIC 连接。
+// 若启用了 TCP 多路复用（TCPMux），后续可通过 Connect() 获取逻辑连接。
+// 若未启用 TCPMux，则每次调用 Connect() 都会新建实际的 TCP 连接。
 func (c *defaultConnectorImpl) Open() error {
 	xl := xlog.FromContextSafe(c.ctx)
 
-	// special for quic
+	// 特殊处理：QUIC 协议
 	if strings.EqualFold(c.cfg.Transport.Protocol, "quic") {
 		var tlsConfig *tls.Config
 		var err error
@@ -84,7 +80,7 @@ func (c *defaultConnectorImpl) Open() error {
 			tlsConfig, err = transport.NewClientTLSConfig("", "", "", sn)
 		}
 		if err != nil {
-			xl.Warnf("fail to build tls configuration, err: %v", err)
+			xl.Warnf("构建 TLS 配置失败: %v", err)
 			return err
 		}
 		tlsConfig.NextProtos = []string{"frp"}
@@ -104,15 +100,18 @@ func (c *defaultConnectorImpl) Open() error {
 		return nil
 	}
 
+	// 未启用 TCP 多路复用，直接返回
 	if !lo.FromPtr(c.cfg.Transport.TCPMux) {
 		return nil
 	}
 
+	// 建立实际连接
 	conn, err := c.realConnect()
 	if err != nil {
 		return err
 	}
 
+	// 创建 yamux 多路复用会话
 	fmuxCfg := fmux.DefaultConfig()
 	fmuxCfg.KeepAliveInterval = time.Duration(c.cfg.Transport.TCPMuxKeepaliveInterval) * time.Second
 	fmuxCfg.LogOutput = io.Discard
@@ -125,7 +124,8 @@ func (c *defaultConnectorImpl) Open() error {
 	return nil
 }
 
-// Connect returns a stream from the underlying connection, or a new TCP connection if TCPMux isn't enabled.
+// Connect 从已建立的底层连接中返回一个逻辑流连接。
+// 如果未启用多路复用，则会建立一个新的 TCP 实际连接。
 func (c *defaultConnectorImpl) Connect() (net.Conn, error) {
 	if c.quicConn != nil {
 		stream, err := c.quicConn.OpenStreamSync(context.Background())
@@ -144,6 +144,7 @@ func (c *defaultConnectorImpl) Connect() (net.Conn, error) {
 	return c.realConnect()
 }
 
+// 建立真实 TCP 连接（无复用）
 func (c *defaultConnectorImpl) realConnect() (net.Conn, error) {
 	xl := xlog.FromContextSafe(c.ctx)
 	var tlsConfig *tls.Config
@@ -164,18 +165,21 @@ func (c *defaultConnectorImpl) realConnect() (net.Conn, error) {
 			c.cfg.Transport.TLS.TrustedCaFile,
 			sn)
 		if err != nil {
-			xl.Warnf("fail to build tls configuration, err: %v", err)
+			xl.Warnf("构建 TLS 配置失败: %v", err)
 			return nil, err
 		}
 	}
 
+	// 解析代理地址
 	proxyType, addr, auth, err := libnet.ParseProxyURL(c.cfg.Transport.ProxyURL)
 	if err != nil {
-		xl.Errorf("fail to parse proxy url")
+		xl.Errorf("解析代理地址失败")
 		return nil, err
 	}
+
 	dialOptions := []libnet.DialOption{}
 	protocol := c.cfg.Transport.Protocol
+
 	switch protocol {
 	case "websocket":
 		protocol = "tcp"
@@ -187,8 +191,10 @@ func (c *defaultConnectorImpl) realConnect() (net.Conn, error) {
 	case "wss":
 		protocol = "tcp"
 		dialOptions = append(dialOptions, libnet.WithTLSConfigAndPriority(100, tlsConfig))
-		// Make sure that if it is wss, the websocket hook is executed after the tls hook.
-		dialOptions = append(dialOptions, libnet.WithAfterHook(libnet.AfterHook{Hook: netpkg.DialHookWebsocket(protocol, tlsConfig.ServerName), Priority: 110}))
+		dialOptions = append(dialOptions, libnet.WithAfterHook(libnet.AfterHook{
+			Hook:    netpkg.DialHookWebsocket(protocol, tlsConfig.ServerName),
+			Priority: 110,
+		}))
 	default:
 		dialOptions = append(dialOptions, libnet.WithAfterHook(libnet.AfterHook{
 			Hook: netpkg.DialHookCustomTLSHeadByte(tlsConfig != nil, lo.FromPtr(c.cfg.Transport.TLS.DisableCustomTLSFirstByte)),
@@ -199,6 +205,7 @@ func (c *defaultConnectorImpl) realConnect() (net.Conn, error) {
 	if c.cfg.Transport.ConnectServerLocalIP != "" {
 		dialOptions = append(dialOptions, libnet.WithLocalAddr(c.cfg.Transport.ConnectServerLocalIP))
 	}
+
 	dialOptions = append(dialOptions,
 		libnet.WithProtocol(protocol),
 		libnet.WithTimeout(time.Duration(c.cfg.Transport.DialServerTimeout)*time.Second),
@@ -206,6 +213,7 @@ func (c *defaultConnectorImpl) realConnect() (net.Conn, error) {
 		libnet.WithProxy(proxyType, addr),
 		libnet.WithProxyAuth(auth),
 	)
+
 	conn, err := libnet.DialContext(
 		c.ctx,
 		net.JoinHostPort(c.cfg.ServerAddr, strconv.Itoa(c.cfg.ServerPort)),
@@ -214,6 +222,7 @@ func (c *defaultConnectorImpl) realConnect() (net.Conn, error) {
 	return conn, err
 }
 
+// 关闭底层连接，确保只关闭一次
 func (c *defaultConnectorImpl) Close() error {
 	c.closeOnce.Do(func() {
 		if c.quicConn != nil {
